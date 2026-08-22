@@ -44,7 +44,7 @@ Remote sessions for the [pi coding agent](https://github.com/earendil-works/pi) 
 
 ## What already exists upstream
 
-pi ships three packages that are exactly the right foundation, and they are further along than the third-party remote UIs assume. Everything below describes the latest stable release, `v0.84.2` (`c49906e`), which is also the base of the fork that carries Part A.
+pi ships three packages that are exactly the right foundation, and they are further along than the third-party remote UIs assume. Everything below describes the latest stable release, `v0.84.2` (`914cf14`), which is also the base of the fork that carries Part A.
 
 | Layer | Exists | Gap |
 | --- | --- | --- |
@@ -95,12 +95,12 @@ The work therefore splits cleanly into **(A) finish the server side upstream** �
 
 ### How Part A reaches pi
 
-Part A is developed in [`frycm/pi`](https://github.com/frycm/pi), a fork that is **always based on the latest stable pi release** (tagged `vX.Y.Z`, currently `v0.84.2`) — never on `main`. The rules:
+Part A is developed in the existing fork [`frycm/pi`](https://github.com/frycm/pi), checked out as a sibling of this repo (`../pi`). The fork is **always based on the latest stable pi release** — the `vX.Y.Z` tag, currently `v0.84.2` (`914cf14`) — never on upstream `main`. The rules:
 
-- Part A is a small, self-contained patch series (service, protocol v2, transport registration) carried on top of the current stable tag. On every upstream release the series is rebased onto the new tag; anything that no longer applies is fixed or dropped, never worked around.
-- pi-palantir pins the fork by exact version (`@frycm/pi-*@0.84.2-palantir.N`) and the README states which upstream stable version that corresponds to.
+- Part A is a small, self-contained patch series (service, protocol v2, transport registration) on a `palantir` branch in the fork, carried on top of the current stable tag. On every upstream release the branch is rebased onto the new tag; anything that no longer applies is fixed or dropped, never worked around.
+- pi-palantir consumes the fork's workspace packages (`@earendil-works/pi-protocol`, `pi-server`, `pi-client`, `pi-coding-agent`) directly from the sibling checkout — `file:../pi/packages/<name>` during development — and records in this README which stable tag the fork branch is based on. No renamed or republished packages.
 - Every patch is written to be upstreamable and is submitted upstream as soon as it is stable. A patch that lands upstream is deleted from the series at the next rebase, so the fork trends toward zero diff.
-- Nothing in Part B depends on unreleased upstream behaviour: whatever `main` gains between releases is picked up only when it ships in a stable tag. Where this document says "upstream has X" it refers to `v0.84.2` (`c49906e`).
+- Nothing in Part B depends on unreleased upstream behaviour: whatever upstream `main` gains between releases is picked up only when it ships in a stable tag. Where this document says "upstream has X" it refers to `v0.84.2`; the contracts cited here are identical at that tag and at current `main` (`c49906e`).
 
 ### `AgentSessionService implements PiServerService`
 
