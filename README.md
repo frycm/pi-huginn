@@ -98,7 +98,18 @@ The work therefore splits cleanly into **(A) finish the server side upstream** �
 Part A is developed in the existing fork [`frycm/pi`](https://github.com/frycm/pi), checked out as a sibling of this repo (`../pi`). The fork is **always based on the latest stable pi release** — the `vX.Y.Z` tag, currently `v0.84.2` (`914cf14`) — never on upstream `main`. The rules:
 
 - Part A is a small, self-contained patch series (service, protocol v2, transport registration) on a `palantir` branch in the fork, carried on top of the current stable tag. On every upstream release the branch is rebased onto the new tag; anything that no longer applies is fixed or dropped, never worked around.
-- pi-palantir consumes the fork's workspace packages (`@earendil-works/pi-protocol`, `pi-server`, `pi-client`, `pi-coding-agent`) directly from the sibling checkout — `file:../pi/packages/<name>` during development — and records in this README which stable tag the fork branch is based on. No renamed or republished packages.
+- pi-palantir consumes the fork's workspace packages under their real scoped names, pointed at the sibling checkout during development — a `file:` specifier changes where npm reads a package, not its name, so the dependency keys are exactly:
+
+  ```json
+  "dependencies": {
+    "@earendil-works/pi-protocol":     "file:../pi/packages/protocol",
+    "@earendil-works/pi-server":       "file:../pi/packages/server",
+    "@earendil-works/pi-client":       "file:../pi/packages/client",
+    "@earendil-works/pi-coding-agent": "file:../pi/packages/coding-agent"
+  }
+  ```
+
+  This README records which stable tag the fork branch is based on. No renamed or republished packages.
 - Every patch is written to be upstreamable and is submitted upstream as soon as it is stable. A patch that lands upstream is deleted from the series at the next rebase, so the fork trends toward zero diff.
 - Nothing in Part B depends on unreleased upstream behaviour: whatever upstream `main` gains between releases is picked up only when it ships in a stable tag. Where this document says "upstream has X" it refers to `v0.84.2`; the contracts cited here are identical at that tag and at current `main` (`c49906e`).
 
@@ -186,8 +197,14 @@ Today's handshake accepts only `version === PROTOCOL_VERSION`, and the strict v1
 - **Legacy hello** (`version: N`): if `N === 1` the server answers the exact v1 `hello` reply (`version: 1` literal, `connectionId`, `snapshot`); otherwise it answers the exact v1 `hello_error` with the existing error code `"version"`. No new error code is introduced, because legacy clients cannot decode one.
 - **Negotiating hello** (`versions: [...]`): the server replies with the highest version both support in `version`, or `hello_error` with code `"version"` when the sets do not intersect. `isSupportedProtocolVersion()` becomes a range check used only on this path.
 - The server instantiates a **per-connection codec** for the negotiated version and keeps a per-connection `version` in `ConnectionState`.
-- **Compatibility test**: the unchanged `PiClient` from `v0.84.2` (legacy hello, strict v1 decoder) connects to the v2 server, lists, creates, attaches, prompts, and steers through a full turn — while a v2 client is attached to the same session and a `ui_request` is raised — without a single decode error.
-- **Event filtering**: v2-only events (`ui_request`, `ui_resolved`) are not sent on v1 connections, and v2-only snapshot fields (`modelState`, `pendingUiRequests`, `historyCursor`, `projectTrusted`) are stripped by the v1 encoder. v1 clients see a v1 session and simply cannot answer approvals.
+- **Compatibility test**: the unchanged `PiClient` from `v0.84.2` (legacy hello, strict v1 decoder) connects to the v2 server, lists, creates, attaches, prompts, and steers through a full turn — while a v2 client is attached to the same session, a `ui_request` is raised and answered, an extension calls `setStatus` / `setWidget` / `setTitle` / `set_editor_text`, and a tool returns a 50 MiB result — without a single decode error on the v1 client, and with the v2 client seeing `ui`, `turnOwner`, and `truncated` metadata in the same session.
+- **v1 projection**: the v1 encoder is a **whitelist**, not a strip list — every outgoing message is projected through the unchanged `v0.84.2` strict schemas and validated against them before framing, so any v2 addition, present or future, is removed mechanically rather than by remembering to list it. Concretely, for a v1 connection:
+  - events `ui_request`, `ui_resolved`, and the `ui_state` progress event are **suppressed** entirely;
+  - snapshot fields `modelState`, `modelStateReason`, `pendingUiRequests`, `historyCursor`, `projectTrusted`, `ui`, and `turnOwner` are projected out;
+  - transcript content parts lose `{ truncated, totalBytes }` in snapshots, `history` is v2-only, and `item_started` / `item_updated` / `item_finished` progress items are projected to the v1 item shape — the *content* stays truncated to `MAX_PART_BYTES` (a v1 client gets the first 256 KiB, which is also what the frame ceiling demands), only the metadata is dropped;
+  - `hello.snapshot` (the server snapshot) goes through the same projection.
+
+  A projection failure (v2 message with no v1 equivalent) is a server bug surfaced to the v1 requester as `invalid_request`; it never reaches the client's decoder. v1 clients see a v1 session and simply cannot answer approvals.
 - Every v2 command and event is additive; nothing in v1 changes meaning.
 
 #### Commands and events
