@@ -30,12 +30,13 @@ Remote sessions for the [pi coding agent](https://github.com/earendil-works/pi) 
 1. Run pi sessions on an always-on machine (workstation, home server, VM); observe and control them from any device over Tailscale.
 2. Web client that installs as an offline-capable PWA on iOS and Android — no app store.
 3. Simple public-key login — the "GitHub public keys / Termius SSH ID" feel — plus zero-click login when Tailscale identity is available.
-4. Voice interaction that is more than STT→prompt→TTS: an optional **interpreter** (frontier model, BYOK, multi-provider) that narrates what a session is doing, answers questions about it, and turns spoken intent into prompts, steers, and approvals.
-5. Build on pi's own `protocol` / `client` / `server` packages rather than inventing another extension-side bridge.
+4. Voice interaction that is a conversation, not dictation: a realtime **voice agent** (OpenAI Realtime, ElevenLabs Conversational AI, xAI Grok Voice — BYOK) talks with the operator, and a **manager** (any frontier or open-weight text model) stands between that conversation and the sessions — it knows what every session is doing, answers questions about them, spins up read-only investigation sessions for questions that need exploring, and turns spoken intent into prompts, steers, and approvals. Results come back asynchronously, the way a human manager would report back.
+5. Sessions are organised as **projects** (one per repository), the way the Claude Code and Codex desktop apps do it: several sessions per project, created fresh or forked from an existing session's state.
+6. Build on pi's own `protocol` / `client` / `server` packages rather than inventing another extension-side bridge.
 
 **Non-goals (v1)**
 
-- Replacing the TUI. The daemon hosts sessions; the TUI attaches to the same sessions later ([phase 6](#phasing)).
+- Replacing the TUI. The daemon hosts sessions; the TUI attaches to the same sessions later ([phase 7](#phasing)).
 - Multi-tenant or multi-user. One operator, many devices.
 - Public-internet exposure. A private network (Tailscale) is assumed; a reverse-proxy story is documented, not built.
 - A native app. PWA only.
@@ -60,33 +61,49 @@ The work therefore splits cleanly into **(A) finish the server side upstream** �
 ## Architecture
 
 ```
-┌──────────────── phone / tablet / PC (PWA) ────────────────┐
-│  UI (Preact + pi-client)                                   │
-│   ├─ SessionList · Transcript · Composer · Approvals       │
-│   ├─ Voice: mic capture → STT ─┐                            │
-│   │          TTS playback  ◄───┤                            │
-│   └─ Interpreter client ◄──────┘                            │
-│        (BYOK keys live here, in IndexedDB, never on host)   │
-│                 │ wss://host.tailnet/pi   (CBOR over TLS)   │
-└─────────────────┼───────────────────────────────────────────┘
+┌──────────────── phone / tablet / PC (PWA) ─────────────────┐
+│  UI (Preact + pi-client)                                    │
+│   ├─ Projects · Sessions · Transcript · Composer · Approvals│
+│   ├─ Voice agent client (WebRTC / WS to the voice provider) │
+│   │      audio in/out ◄──► tool calls ──► manager           │
+│   └─ Manager (text model, tools over the protocol)          │
+│        runs here, or behind the proxy (see below)           │
+│                 │ wss://host.tailnet/pi   (CBOR over TLS)    │
+└─────────────────┼────────────────────────────────────────────┘
                   │  HTTP upgrade: Origin check · auth (Tailscale whois | device-key cookie)
-┌─────────────────▼────────── pi-palantir daemon ─────────────┐
-│  WebSocketListener ──► PiServer (pi-server)                 │
-│                             │ PiServerService               │
-│                      AgentSessionService  (Part A, upstream)│
-│                             │                               │
-│      AgentSession #1   AgentSession #2   AgentSession #n    │
-│      (coding-agent SDK: real tools, extensions, skills)     │
-│                                                             │
-│  Static PWA assets · /auth · /pair · /interp proxy · /health│
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────▼────────── pi-palantir daemon ──────────────┐
+│  WebSocketListener ──► PiServer (pi-server)                  │
+│                             │ PiServerService                │
+│                      AgentSessionService  (Part A, upstream) │
+│                             │                                │
+│   project ~/src/app           project ~/src/lib              │
+│   ├─ AgentSession #1 (work)   └─ AgentSession #3 (work)      │
+│   └─ AgentSession #2 (read-only fork of #1 — investigation)  │
+│      (coding-agent SDK: real tools, extensions, skills)      │
+│                                                              │
+│  Static PWA assets · /auth · /pair · /health                 │
+└──────────────────────────────────────────────────────────────┘
+┌──── palantir proxy (required for voice; in the daemon by default) ┐
+│  token broker: holds voice provider keys, mints short-lived       │
+│  tokens for the browser · optionally holds the manager key and    │
+│  hosts the manager · optionally hosts the manager state store     │
+└───────────────────────────────────────────────────────────────────┘
 ```
+
+Three layers, each seeing only what it needs:
+
+| Layer | Sees | Talks to |
+| --- | --- | --- |
+| **Voice agent** (realtime provider) | The conversation, a small tool set, and what the manager chooses to say. **Never** raw transcripts, tool payloads, diffs, or file contents. | The operator (audio), the manager (tool calls). |
+| **Manager** (text model) | Compact digests of every session, the protocol. | The voice agent (tool results, announcements), the daemon (protocol commands). |
+| **Daemon** (pi) | Projects, sessions, the coding models. | Clients over the protocol. Never the voice or manager keys. |
 
 ### Trust boundaries
 
 - **Daemon host** holds credentials for the *coding* models (pi's normal `auth.json`). It may hold none at all — "pi on the server without model access" is a supported, **observe-only** configuration: sessions can be listed, attached, and read, but `prompt` / `steer` are rejected until a model is selected. How that state is encoded on the wire is specified under [no-model sessions](#no-model-sessions).
 - **Project trust** is the host's, not the client's. A remote `create` pointing at a directory with project extensions goes through the same trust gate the CLI uses ([below](#project-trust)); the daemon never executes untrusted project code because a phone asked it to.
-- **Client device** holds the *voice and interpreter* BYOK keys. They go straight from the browser to ElevenLabs / OpenAI / xAI / Anthropic. The daemon never sees them unless the user opts into the `/interp` proxy, which exists only for providers that block browser calls, and which stores nothing.
+- **Voice keys never reach the browser.** All three voice providers require a server-side exchange of the long-lived key for a short-lived browser token, so whenever voice is enabled the [proxy](#the-proxy)'s token-broker role is **mandatory** — embedded in the daemon process by default, or run separately. The voice key lives only there.
+- **The manager key** may live on the client device (IndexedDB, used straight from the browser) or on the proxy when the manager is hosted there. Either way it is on a machine the operator controls. The session host itself never needs voice or manager keys and may run with no model access at all.
 - Everything runs on the tailnet. The daemon refuses to bind to non-private interfaces without an explicit `--insecure-bind`.
 
 ---
@@ -158,7 +175,7 @@ The protocol's default frame ceiling is 16 MiB, and a long session's transcript 
 | Command | Purpose |
 | --- | --- |
 | `history { sessionId, before: cursor, limit? }` | Page backwards. `limit` is a ceiling on item count; the real bound is encoded bytes — the server stops adding items at 4 MiB and returns `next` so the client continues. Parts are truncated exactly as in the snapshot. |
-| `read_item { sessionId, itemId, partIndex, offset, length? }` | Fetch a **byte range** of one content part, `length` capped at 4 MiB; the response carries `{ bytes, offset, totalBytes, next? }`. Full content is obtained by range continuation, never in one message. This is what the interpreter's `read_more` calls (with a small `length`). |
+| `read_item { sessionId, itemId, partIndex, offset, length? }` | Fetch a **byte range** of one content part, `length` capped at 4 MiB; the response carries `{ bytes, offset, totalBytes, next? }`. Full content is obtained by range continuation, never in one message. This is what the manager's `read_more` calls (with a small `length`). |
 
 Raising the frame limit is explicitly **not** the answer; the suite includes a test that a 50 MiB tool result round-trips through snapshot, history, progress, and `read_item` without any message above `MAX_MESSAGE_BYTES`.
 
@@ -213,6 +230,8 @@ Today's handshake accepts only `version === PROTOCOL_VERSION`, and the strict v1
 | --- | --- |
 | `ui_request` event · `ui_respond` command · `ui_resolved` event | Surface extension UI — `confirm`, `select`, `input`, `editor`, and tool-approval prompts — to remote clients, mirroring the `extension_ui_request` / `extension_ui_response` contract in pi's `docs/rpc.md`, including the fire-and-forget methods `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text` (sent with `expectsResponse: false`). **Non-negotiable**: without it a remote client cannot answer a permission prompt. Semantics under [pending UI requests](#pending-ui-requests). |
 | `history`, `read_item` | Byte-bounded transcript paging and ranged content-part fetch (see [bounded transcript](#bounded-transcript)). New v2 error codes used by this section and the ones below: `project_untrusted`, `stale_request`, `stale_revision`; v1 connections receive `invalid_request` in their place. |
+| `create { cwd, readOnly?, forkFrom?: { sessionId, itemId } }` (v2 extension) | Creates a session in a project (`cwd`). `forkFrom` copies the source session's history up to `itemId` — the same operation as `fork` below, exposed at creation so the manager can open an investigation in one call. `readOnly: true` makes the session unable to mutate the checkout, enforced by the daemon rather than promised by a prompt, in three layers: **(1)** project extensions, skills, prompts, and settings are **not loaded** — pi imports extension modules and runs their factories while constructing a session, so any extension code would already defeat a tool allowlist (the snapshot reports `projectResources: "withheld"`); **(2)** the built-in tool set is restricted to the read-only built-ins — `read`, `grep`, `find`/`ls`, `git` read subcommands — with `bash`, `write`, and `edit` absent rather than filtered, since a bash read-only classifier is not something to trust; **(3)** optionally, the session process runs under an OS-level read-only filesystem sandbox (`sandbox-exec` on macOS, `bwrap` with a read-only bind on Linux) as defence in depth, off by default in v1. The snapshot carries `readOnly: true` and the session is listed as ephemeral (hidden from the default session list, auto-archived after a configurable idle period). Read-only sessions share the project's working tree, which is safe precisely because they cannot write. Worktree-backed sessions that *do* work in parallel are a later phase. |
+| `server_snapshot` grouping (v2) | `SessionMetadata` gains `project` (the git toplevel of `cwd`, or `cwd` itself outside a repository), `readOnly`, and `forkedFrom`. Projects are a grouping key, not a separate entity — nothing is created or stored for them. |
 | `fork { sessionId, itemId }`, `switch { sessionId, targetSessionId }` | Session-tree navigation as **server-level** operations. `LiveSessionManager` keys a runtime by its original ID and rejects a snapshot whose ID changes, so neither can mutate the runtime in place. Both return `{ sessionId }` of the destination; the client then performs an explicit `detach` / `attach` transition, and the source runtime is left untouched. |
 | `read_file { path, range }`, `diff { ref? }` | Read-only views for review on a phone. The server enforces cwd-rooted paths and a size cap. |
 | `list_commands` | Discovery metadata for the `/` palette: name, description, source (builtin / extension / skill / template). Execution stays on `prompt` with `source: "rpc"` — `AgentSession.prompt()` already recognises extension commands and expands skills and templates, so a separate `slash` command would duplicate routing and drift from the TUI. |
@@ -241,7 +260,7 @@ Upstream's `exclusive` / `shared` leases are maps inside one `PiClient`; the ser
 - While a turn is owned: `prompt` from anyone is `busy` (as today); `steer` is accepted from the owner and rejected for other connections with `session_locked`; `abort` is accepted from **any** attached connection — every surface is the same operator, and an emergency stop must not depend on which device started the turn. `ui_respond` keeps first-response-wins across all attachments.
 - If the owning connection disconnects mid-turn, the run continues and ownership becomes **orphaned** (`turnOwner` cleared, phase still busy): the next `steer` from any attachment claims ownership atomically for the remainder of the turn. A client that reconnects with the same device identity does not get its ownership back automatically; it steers and re-claims like anyone else.
 - Client-local leases stay as a client-side convenience for a single client's own components; they grant nothing on the server.
-- Phase 6 (TUI as client) relies on this and nothing else to serialise surfaces; open question 3 is resolved by it.
+- Phase 7 (TUI as client) relies on this and nothing else to serialise surfaces; open question 3 is resolved by it.
 
 ### CLI: build on `pi server --listen`
 
@@ -258,9 +277,11 @@ Upstream already ships experimental `pi server` / `pi client` commands and `pi -
 pi-palantir/
 ├─ package.json     # "pi": { "extensions": ["./extension/index.ts"] }
 ├─ extension/       # TUI side: /palantir start|stop|status|pair, QR, status-line segment
-├─ daemon/          # node: WebSocket listener, auth, static assets, /interp proxy
+├─ daemon/          # node: WebSocket listener, auth, static assets
+├─ proxy/           # optional: provider keys, ephemeral voice tokens, hosted manager
+├─ manager/         # the manager agent: digests, tools, announcement queue (runs in web/ or proxy/)
 ├─ web/             # PWA (Vite). No Node imports. pi-client + the transcript reducer.
-└─ shared/          # auth token format, interpreter tool schema
+└─ shared/          # auth token format, manager tool schema, voice-agent tool schema
 ```
 
 ### WebSocket listener
@@ -291,47 +312,98 @@ Two mechanisms, tried in order. Both resolve to an operator identity; anything e
 
 - **Stack** — Vite and Preact, small enough to stay quick on a phone; `pi-client` for the protocol and the upstream `RemoteSession` plus transcript reducer for state. Markdown and diff rendering; no terminal emulator.
 - **Transport** — WebSocket binary frames, wrapped in an exponential-backoff reconnect loop around `PiClient.reconnect()`, since the client deliberately does not reconnect on its own. Reconnect re-attaches previously attached sessions; snapshots are authoritative for *state*, so no event replay is needed — pending approvals arrive in `pendingUiRequests`, older history through `history`.
-- **Screens** — Sessions (grouped by cwd, phase badge, last activity) · Session (transcript tail with collapsible tool calls and "load earlier" paging, queued steers, approval cards from `pendingUiRequests`) · Composer (text, image paste and camera via the v2 image content parts, `/` palette from `list_commands`) · Settings (device keys, voice providers, interpreter).
+- **Screens** — Projects (one per repository, sessions beneath with phase badge and last activity; ephemeral investigation sessions collapsed by default) · Session (transcript tail with collapsible tool calls and "load earlier" paging, queued steers, approval cards from `pendingUiRequests`) · New session (fresh or forked from an item, in the project's checkout) · Composer (text, image paste and camera via the v2 image content parts, `/` palette from `list_commands`) · Manager (text chat with the manager — the same agent voice uses, usable without voice) · Settings (device keys, voice provider, manager model, proxy).
 - <a id="offline-and-reconnect"></a>**Offline and reconnect** — a service worker precaches the shell, and the last snapshot per session is persisted to IndexedDB, so opening the app with no connectivity still shows state. A prompt composed offline is **queued, not auto-replayed**: every mutation carries a `requestId` and the `expectedRevision` the user was looking at when they wrote it. On reconnect the client first receives the fresh snapshot; if the revision still matches, it sends the queued mutation (the server's `requestId` dedupe makes the retry safe even if the original was accepted just before the drop); if the session has moved on — another device prompted, a turn finished — the draft stays in the composer marked *written against an older state* for the user to send or discard. Nothing else is meaningfully offline.
 - **Notifications** — Web Push when a session raises a `ui_request` or finishes a turn while the app is backgrounded. VAPID keys are generated on first daemon run. iOS supports Web Push for installed PWAs from 16.4.
 
 ### Voice
 
-Three independently configurable slots, all bring-your-own-key, all client-side.
+Voice is a conversation with the **manager**, not a way to type prompts. The operator talks to a realtime voice agent; the voice agent talks to the manager through tool calls; the manager talks to the sessions through the protocol.
 
-| Slot | Providers (v1) |
-| --- | --- |
-| STT | ElevenLabs Scribe (streaming), OpenAI `gpt-4o-transcribe` / Whisper, xAI, browser `SpeechRecognition` (free fallback) |
-| TTS | ElevenLabs (streaming), OpenAI, xAI, browser `speechSynthesis` (free fallback) |
-| Interpreter | Anthropic, OpenAI, xAI — or none, which leaves plain dictation |
+**What crosses to the voice provider.** The voice agent has to speak the manager's answers, so session-*derived* text necessarily reaches the provider: spoken summaries, basenames, one-line error descriptions, approval prompts. The boundary is therefore precise rather than absolute — raw transcript items, tool results, diffs, file contents, and `read_item` payloads never cross; only text the manager authored for speech does, and the manager's spoken-output rules double as redaction rules: no file contents or code, no command lines beyond the tool name, no environment values, secrets, tokens, or URLs with credentials, paths as basenames. Operators who want nothing session-derived at a voice vendor use the cascade alternative below with browser `speechSynthesis` for output.
 
-Two modes:
+#### Voice agent
 
-- **Dictation** — push-to-talk, STT, text lands in the composer for review. The mobile equivalent of `pi-voice-stt`.
-- **Conversation** — hold-to-talk, STT, then the interpreter either speaks an answer, submits a prompt or steer, answers a pending `ui_request`, or aborts. Side effects are confirmed aloud before execution unless "act immediately" is enabled.
+Three realtime speech-to-speech providers, bring-your-own-key, selectable in Settings. Surveyed **22 August 2026** — identifiers and prices are as of that date; all three support client-side tool calling, browser connections via short-lived tokens, and injecting text into a running conversation — the three things the manager needs. Prices are list, per provider pages, and change often.
 
-### The interpreter
+| Provider | Model | Browser transport | Token | Tools | Inject an announcement | Rough cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| **OpenAI Realtime** | `gpt-realtime-2.1` (flagship); `gpt-realtime-2.1-mini` for cost | WebRTC (also WebSocket, SIP) | `POST /v1/realtime/client_secrets`, minted by the proxy | Client-side function calling over the data channel; MCP servers | `conversation.item.create` with a text item, then `response.create` | $32 / $64 per 1M audio in/out tokens (≈ $0.30–0.40/min); mini ≈ $0.06–0.15/min |
+| **ElevenLabs Agents** (Conversational AI) | Agent configured in ElevenLabs. Voice: `eleven_v3_conversational` (most expressive realtime model, ~280 ms; `eleven_flash_v2_5` at ~75 ms if latency matters more). LLM is the operator's choice there — hosted Claude, GPT-5, Gemini, Qwen, or a custom OpenAI-compatible endpoint | WebRTC or WebSocket via the JS SDK | Conversation token from the agents API, minted by the proxy | Client tools (run in the SDK), webhook tools, MCP | `sendContextualUpdate` (invisible to the user, visible to the agent) or `sendUserMessage` (forces a turn) | ≈ $0.08–0.10/min of conversation plus LLM tokens |
+| **xAI Grok Voice** | `grok-voice-latest` (= `grok-voice-think-fast-2.0`) | **WebSocket only** — no WebRTC; the browser sends Opus/PCM frames itself | Ephemeral `xai-client-secret.…` in the WebSocket protocol header, minted by the proxy | Client-side function tools, MCP | `conversation.item.create` with a text message | $0.08/min for Think Fast 2.0 (`grok-voice-latest` since 5 Aug 2026); 1.0 remains at $0.05/min |
 
-A small agent, running in the browser by default, with a system prompt and tools rather than free-form text:
+Recommended order:
+
+1. **OpenAI Realtime first.** WebRTC from the browser is the least work on a phone (the browser handles capture, playback, echo cancellation, and codec), tool calling and mid-conversation injection are the most mature, and the whole agent — prompt and tools — is defined by palantir at connect time.
+2. **ElevenLabs second**, for voice quality — `eleven_v3_conversational` is the most natural voice of the three — and for operators who want Claude behind the voice. The trade-off: prompt, tools, and LLM are configured in the ElevenLabs agent, not by palantir, so palantir ships a reference agent definition and the operator applies it. The proxy holds only the ElevenLabs key; xAI is not among ElevenLabs' hosted LLMs, and a custom endpoint must be OpenAI-compatible.
+3. **xAI third.** Cheapest and the only one that exposes "think" models for voice, but WebSocket-only means palantir owns audio capture and Opus encoding in the browser — more code, and weaker on iOS Safari.
+
+The voice agent's system prompt describes the manager and its tools; it does **not** contain session content. Its tool set is small and identical across providers, executed client-side and forwarded to the manager:
 
 ```
-Context per turn:
-  · compact session digest — last N transcript items, tool calls collapsed to
-    name + status + one-line result, current phase, pending ui_request
-  · the user's utterance
+status(sessionId?)                 → what is / was happening (answered from the manager's cached digest — fast)
+ask(question, sessionId?)          → a question that needs the manager to read or investigate (async, returns a ticket)
+act(intent, sessionId?)            → "tell it to also update the tests", "approve", "stop" (confirmed aloud unless "act immediately" is on)
+new_session({ project, forkFrom? }) → start a working session
+```
 
-Tools:
-  say(text)                     → TTS
-  prompt(text) / steer(text)    → protocol commands (exclusive lease)
-  respond_ui(requestId, answer) → approvals and selects
+Because the tool set is the contract, providers are interchangeable, and the cascade alternative (STT + text model + TTS) remains possible as a fourth, cheaper "provider" behind the same tools — it is deliberately not in v1.
+
+#### The manager
+
+A text-model agent — Anthropic, OpenAI, xAI, or an open-weight model through any OpenAI-compatible endpoint, BYOK — that is the single middle-man between the operator and every session. It runs in the browser by default, or behind the proxy when the operator prefers keys server-side.
+
+```
+State it maintains (rebuilt from snapshots, refined by session_progress — not read on demand):
+  · per session: compact digest — last N transcript items, tool calls collapsed to
+    name + status + one-line result, current phase, pending ui_request, turn owner
+  · announcement queue — things the operator has not heard yet
+
+Tools over the protocol:
+  prompt(text) / steer(text)               → protocol commands on a session
+  respond_ui(requestId, answer)            → approvals and selects
   abort()
-  read_more(itemId)             → pull a tool result or diff into context on demand
+  read_more(sessionId, itemId)             → pull a tool result or diff into context on demand (via read_item)
+  investigate(question, { project, forkFrom? })
+                                           → create a read-only session (fresh in the project, or forked from
+                                             an item of an existing session), prompt it with the question,
+                                             and report back when its turn ends
+  list_projects() / list_sessions(project)
 ```
 
+- **Async by design.** `ask` and `investigate` return immediately ("I've asked — I'll tell you"); the operator keeps talking about something else. When the investigation's turn ends the manager reads its result, condenses it, and pushes an announcement to the voice agent. Turn end and new `ui_request` on any session feed the same queue, so there is exactly one mechanism for "something to tell the operator", with three sources.
+- **Interrupt policy.** Announcements are delivered when the operator pauses, never mid-sentence; a `ui_request` is the only source allowed to pre-empt, and only after a configurable silence.
 - **Digest, not full transcript** — mobile context and cost both matter; `read_more` fetches detail only when the conversation needs it ("what did the test output actually say?").
-- **Voice-shaped output** — the system prompt enforces short spoken sentences, no code recitation unless asked, file paths spoken as basenames.
-- **Proactive narration (opt-in)** — on turn end or a new `ui_request`, the interpreter runs with an empty utterance to announce what happened: *"Finished — three files edited, tests pass. It wants permission to run `git push`. Allow?"*
-- **Keys stay on the device.** The `/interp` daemon proxy exists only for providers without workable CORS and forwards keys per request without storing them.
+- **Voice-shaped output** — short spoken sentences, file paths spoken as basenames. The manager writes for the ear; the voice agent only repeats. With provider-backed voice the manager's spoken output **never** contains code, file contents, or command lines — not even when asked; "read me that function" is answered by putting it on the Session screen and saying so. Code recitation on request is allowed only on the local `speechSynthesis` cascade, where nothing leaves the device.
+- **Text is first-class.** The Manager screen in the PWA is the same agent over a text box. It ships before voice and is how the manager is tested.
+- **Scope per conversation.** The manager's own context lives for one voice call or chat tab; the session digests and the announcement outbox persist (below). Manager memory across calls is a later phase.
+
+<a id="manager-state-and-recovery"></a>**Manager state and recovery.** At the pinned upstream contract `session_progress` is transient and reaches only currently attached connections, so a suspended browser tab or a dropped connection loses events. The manager therefore never depends on having seen them:
+
+- **Ownership.** The manager state store lives where the manager runs: IndexedDB when the manager is in the browser, the proxy's disk when it is hosted there. It holds, per session, the digest plus the `revision` it was built at, and the announcement outbox.
+- **Snapshots are authoritative.** On every attach and reconnect the manager rebuilds each session's digest from `session_snapshot` (paging through `history` only as far as the stored `revision`, so a short gap costs one page). Progress events between snapshots only refine the digest; nothing is derived *solely* from an event.
+- **Announcements are derived from state, not from events.** Each announcement has an id that is a pure function of its cause — `turn_end:<sessionId>:<revision>`, `ui_request:<sessionId>:<requestId>`, `investigation:<sessionId>` — and is produced by diffing the rebuilt digest against the stored one: revision advanced with the session now idle → turn ended; `pendingUiRequests` contains an id not in the outbox → new approval; an investigation session reached idle → result ready. Missed events therefore yield the same announcements after reconnect, and regenerating from the same state is idempotent — the id deduplicates.
+- **Acknowledgement.** An announcement is `pending` until delivered and heard: the voice adapter marks it `spoken` when the provider confirms the injected turn completed; the Manager screen marks it `shown` when rendered in a focused tab. Until then it is redelivered on the next opportunity, including after a reconnect or from a different device.
+- **Retention.** An announcement is dropped when acknowledged, when its cause is superseded (the `ui_request` was resolved, the session was archived, a later `turn_end` for the same session exists — only the latest is kept), or after 24 hours. The digest for a session is dropped when the session is archived.
+
+#### Investigation sessions
+
+Questions the manager cannot answer from digests — "why is the migration failing?", "what does the scheduler actually do?" — get a session of their own so they never compete with the working session's queue or lease:
+
+- **Fresh** in the project (`create { cwd, readOnly: true }`) when the question is about the code as it is on disk.
+- **Forked** from a session item (`forkFrom`) when the question is about what a session did or knows. A fork sees history up to that item; it does not see the source session's in-flight turn.
+- Always **read-only**, enforced daemon-side: no project extensions loaded, read-only built-ins only, no bash, optional OS sandbox (see the `create` row in [commands and events](#commands-and-events)). That is what makes sharing the working tree safe. The price is that investigations run without the project's extensions and skills; a question that needs them is asked of the working session instead. Parallel sessions that *write* are a later phase and will need worktrees.
+- **Ephemeral**: hidden from the default session list, auto-archived after idle. The manager keeps the answer; the session is disposable.
+
+#### The proxy
+
+A component (`proxy/`) with one mandatory role and two optional ones. By default it runs inside the daemon process behind the same listener and auth (device key or Tailscale identity); the operator may instead run it on another host reachable from the PWA.
+
+- **Token broker — mandatory whenever voice is enabled.** Holds the voice provider key and exchanges it for the short-lived token the browser connects with: OpenAI `POST /v1/realtime/client_secrets`, ElevenLabs conversation token, xAI ephemeral `xai-client-secret`. All three providers require this server-side exchange for a private browser session; there is no browser-only voice configuration. The broker does not see audio or the conversation — the browser connects to the provider directly with the token.
+- **Manager host — optional.** Holds the manager's model key and runs the manager, so the PWA is a thin client and several devices share one manager and one state store.
+- **Manager state store — optional.** When the manager is hosted here, the durable digest and announcement outbox ([below](#manager-state-and-recovery)) live on the proxy's disk instead of the browser's IndexedDB.
+
+It keeps no transcripts and no audio. Without voice, the PWA needs no proxy at all: with the manager key on the device, the Manager text chat is fully proxy-less.
 
 ### Extension (TUI side)
 
@@ -345,7 +417,10 @@ Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay),
 | --- | --- |
 | The daemon hosts sessions; the TUI attaches as a client later | Otherwise "remote" dies with the terminal. v1 can coexist: daemon-hosted and TUI-hosted sessions are separate session files, and the web UI sees only the former. |
 | Auth in the HTTP upgrade, not in the protocol | Matches pi-server's stated design and keeps the protocol runtime-neutral. |
-| Voice and interpreter BYOK is client-side | The host may be a shared server; keys for *my* voice stay on *my* phone. It also lets the host run without model access while the client still has an interpreter. |
+| Voice keys live only on the token broker; manager keys on the device or the broker | Every voice provider requires a server-side token exchange, so a broker is unavoidable; making it a daemon role by default keeps the one-process deployment. The session host itself never needs either key and can run without model access. |
+| The voice agent hears only what the manager wrote for speech | Keeps its context tiny, makes the three voice providers interchangeable, and keeps raw transcripts, tool output, diffs, and file contents away from the voice vendor — only redacted spoken summaries cross. The manager is the only component that reads sessions. |
+| One manager, many sessions, async replies | A manager that reports back later — instead of a voice loop that blocks on one session — is what lets the operator keep talking while sessions work. Turn end, approvals, and investigation results all flow through one announcement queue. |
+| Investigation sessions are read-only and ephemeral | Parallel exploration without worktrees, lease contention, or list clutter. Writing in parallel is a later phase. |
 | PWA, not native | iOS Web Push and standalone mode are good enough since 16.4; no store friction; one codebase. The native remote apps in this space pay for that choice in maintenance. |
 | No terminal or git UI in v1 | Stay inside the protocol's session abstraction. `read_file` and `diff` cover review-on-phone. |
 | Protocol additions are additive v2, with explicit version negotiation | `ui_request` is required for real use; everything else can slip a phase. The handshake advertises a version range and the server filters v2 shapes off v1 connections, so v1 clients never see a frame they cannot decode. |
@@ -360,9 +435,10 @@ Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay),
 | 1 | WebSocket listener with Origin check, **TLS**, Tailscale auth, minimal transcript view | Open `https://<host>.<tailnet>.ts.net` on a phone over a trusted certificate — service worker, WebCrypto, mic, and Push all require a secure context — and watch a live session. TLS ships in one of two modes: `tailscale serve` in front of a loopback-bound daemon (recommended: Tailscale provisions and renews the certificate and forwards identity headers), or `--tls-cert/--tls-key` from `tailscale cert`, with the daemon warning at startup when the certificate is within 14 days of expiry and refusing to start once it has expired. The served hostname is the MagicDNS name; the raw `100.x` address is not served. |
 | 2 | Protocol v2 negotiation, `ui_request` approvals with `pendingUiRequests`, composer with image parts (camera/paste), mutation envelope with `requestId`/`expectedRevision`, PWA install, push | Drive a full session from a phone, including tool approvals and sending a photo, with two devices attached and no double-answered approval. |
 | 3 | Device-key pairing, `authorized_keys`, revocation | A tailnet device whose Tailscale login is **not** in `allowedLogins` (a shared node, or a second account) pairs by QR and drives a session through the phase-1 endpoint; revoking its key closes its connection within one upgrade. Reachability and TLS are unchanged from phase 1 — device keys are authentication only. |
-| 4 | Dictation voice — ElevenLabs and OpenAI first | Hands-free prompt entry. |
-| 5 | Interpreter — Anthropic first, then OpenAI and xAI — plus proactive narration | "What's it doing?", "approve", "also update the tests" — by voice. |
-| 6 | TUI attaches to daemon sessions | One session visible in the terminal and on the phone at once. |
+| 4 | Projects and investigation sessions (Part A): `create` with `readOnly` / `forkFrom`, project grouping in `server_snapshot`, read-only tool allowlist, ephemeral archiving | From the PWA, fork a running session into a read-only sibling, ask it a question, get the answer, and see the working session untouched. A read-only session attempting a write is rejected by the daemon. |
+| 5 | Manager over text — Anthropic first, then OpenAI, xAI, OpenAI-compatible — with digests, `investigate`, and the announcement queue; Manager screen in the PWA | "What's it doing?", "approve", "also update the tests", "why does the build fail?" — typed; the last one answered later by an investigation session while the chat continues. |
+| 6 | Voice agents — OpenAI Realtime first, then ElevenLabs Conversational AI and xAI Grok Voice — plus the proxy (ephemeral tokens, hosted manager) | The same four tools by voice; an announcement arrives mid-conversation without cutting the operator off. |
+| 7 | TUI attaches to daemon sessions | One session visible in the terminal and on the phone at once. |
 
 ---
 
@@ -373,20 +449,22 @@ Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay),
 3. **Lease semantics.** Resolved by server-side [turn ownership](#turn-ownership); client leases are local conveniences only.
 4. **iOS audio.** Background microphone capture is impossible in Safari, so conversation mode is foreground-only. Acceptable.
 5. **Tailscale LocalAPI availability.** Socket permissions differ across platforms; `tailscale serve` identity headers avoid the LocalAPI entirely, and the device-key path is always present as a fallback.
-6. **Interpreter cost.** Proactive narration can fire often — rate-limit to once per turn end and debounce `ui_request` bursts.
-7. **Idle retention upstream.** Keeping an `AgentSession` warm across an idle gap belongs in `PiServer` (see `dispose()` above). Until that option exists, a session with no attachments that goes idle is disposed and re-opened from disk on the next attach — correct, just slower.
+6. **Manager cost and latency.** Two model hops sit between the operator and a session (voice agent → manager). Status questions must be answered from the cached digest, never by a fresh read; only `ask` / `investigate` may be slow, and they are async. Announcements are rate-limited to once per turn end, with `ui_request` bursts debounced.
+7. **Voice-provider tool semantics differ.** All three execute tools client-side and all three accept injected text (`conversation.item.create` on OpenAI and xAI, `sendContextualUpdate` on ElevenLabs), but whether an injected announcement makes the agent *speak* unprompted differs — OpenAI and xAI need an explicit `response.create`, ElevenLabs needs `sendUserMessage` to force a turn. The interrupt policy therefore lives in palantir, which decides *when* to inject, and the per-provider adapter only knows *how*. xAI's WebSocket-only transport also means palantir owns audio capture and encoding for that provider.
+8. **Read-only enforcement.** Withholding project extensions and removing `bash` is enforceable with what the coding-agent SDK exposes today; the OS sandbox layer is platform-specific and may never be uniform. The open cost is usefulness: an investigation without the project's skills may answer less well than the working session would. Measure before deciding whether worktree-backed full sessions should replace read-only ones for investigations.
+9. **Idle retention upstream.** Keeping an `AgentSession` warm across an idle gap belongs in `PiServer` (see `dispose()` above). Until that option exists, a session with no attachments that goes idle is disposed and re-opened from disk on the next attach — correct, just slower.
 
 ---
 
 ## Prior art
 
-Surveyed before starting; none of these combine remote web/mobile access, public-key auth, and BYOK voice with an interpretation layer, and none build on pi's own protocol packages.
+Surveyed before starting; none of these combine remote web/mobile access, public-key auth, and BYOK conversational voice with a manager layer between the operator and the sessions, and none build on pi's own protocol packages.
 
 | Project | What it does | Why not just use it |
 | --- | --- | --- |
 | [jmfederico/pi-web](https://github.com/jmfederico/pi-web) | Most mature web UI; machines → projects → workspaces → sessions, multi-machine proxying | No voice; auth undocumented; own session daemon rather than the protocol packages |
 | [BlackBeltTechnology/pi-agent-dashboard](https://github.com/BlackBeltTechnology/pi-agent-dashboard) | Mobile-first dashboard, OAuth2 (GitHub/Google/OIDC), mDNS and zrok, mirrors the TUI | No voice; bridge-extension architecture; heavier than needed |
-| [`@firstpick/pi-package-webui`](https://pi.dev/packages/@firstpick/pi-package-webui) | Web UI plus an optional browser "Natural Conversation Mode" voice loop | Voice is plain STT→prompt→TTS with no interpretation; LAN PIN auth only |
+| [`@firstpick/pi-package-webui`](https://pi.dev/packages/@firstpick/pi-package-webui) | Web UI plus an optional browser "Natural Conversation Mode" voice loop | Voice is plain STT→prompt→TTS with no manager in between; LAN PIN auth only |
 | [remote-pi](https://github.com/jacobaraujo7/remote_pi) | Native iOS and Android apps, Ed25519 identity, QR pairing, WebSocket relay | Relay sees plaintext; no voice; native apps |
 | [pi-remote-control](https://github.com/zerray/pi-remote-control) | iOS app plus relay daemon, Tailscale-friendly | iOS only, closed app, no voice |
 | [`@howaboua/pi-gippity-control`](https://pi.dev/packages/@howaboua/pi-gippity-control) | WebRTC realtime voice into a LAN web UI | Requires an OpenAI Codex login; not BYOK or multi-provider; unauthenticated by design |
