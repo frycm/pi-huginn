@@ -44,7 +44,7 @@ Remote sessions for the [pi coding agent](https://github.com/earendil-works/pi) 
 
 ## What already exists upstream
 
-pi ships three packages that are exactly the right foundation, and they are further along than the third-party remote UIs assume.
+pi ships three packages that are exactly the right foundation, and they are further along than the third-party remote UIs assume. Everything below describes the latest stable release, `v0.84.2` (`c49906e`), which is also the base of the fork that carries Part A.
 
 | Layer | Exists | Gap |
 | --- | --- | --- |
@@ -93,6 +93,15 @@ The work therefore splits cleanly into **(A) finish the server side upstream** �
 
 ## Part A — upstream server completion
 
+### How Part A reaches pi
+
+Part A is developed in [`frycm/pi`](https://github.com/frycm/pi), a fork that is **always based on the latest stable pi release** (tagged `vX.Y.Z`, currently `v0.84.2`) — never on `main`. The rules:
+
+- Part A is a small, self-contained patch series (service, protocol v2, transport registration) carried on top of the current stable tag. On every upstream release the series is rebased onto the new tag; anything that no longer applies is fixed or dropped, never worked around.
+- pi-palantir pins the fork by exact version (`@frycm/pi-*@0.84.2-palantir.N`) and the README states which upstream stable version that corresponds to.
+- Every patch is written to be upstreamable and is submitted upstream as soon as it is stable. A patch that lands upstream is deleted from the series at the next rebase, so the fork trends toward zero diff.
+- Nothing in Part B depends on unreleased upstream behaviour: whatever `main` gains between releases is picked up only when it ships in a stable tag. Where this document says "upstream has X" it refers to `v0.84.2` (`c49906e`).
+
 ### `AgentSessionService implements PiServerService`
 
 New, in `packages/coding-agent/src/server/agent-session-service.ts` upstream:
@@ -129,30 +138,43 @@ export class AgentSessionService implements PiServerService {
 
 #### Bounded transcript
 
-The protocol's default frame ceiling is 16 MiB, and a long session's transcript can exceed that cumulatively even with per-result truncation. A snapshot therefore carries a **tail window** — the most recent items up to a byte budget (default 1 MiB, configurable) — plus a `historyCursor` marking where the window starts. The rest is fetched on demand:
+The protocol's default frame ceiling is 16 MiB, and a long session's transcript can exceed that cumulatively even with per-result truncation. Bounding only the initial snapshot is not enough — a history page, an "untruncated" item, or an `item_finished` progress event carrying a large tool result can each blow the frame on its own. So the budget applies to **every message on every path**:
+
+- **`MAX_MESSAGE_BYTES`** = 8 MiB encoded (half of `DEFAULT_MAX_FRAME_LENGTH`, leaving headroom for the envelope). The server encoder asserts it before sending any event or response; exceeding it is a server bug surfaced as `PiServerError("invalid_request", "message too large")` to the requester, never a dropped connection. Clients are held to the same budget for requests (see the image limits below).
+- **`MAX_PART_BYTES`** = 256 KiB per content part (text, tool output, diff). Any content part larger than that is carried **truncated** — first 256 KiB plus `{ truncated: true, totalBytes }` — wherever an item appears: the snapshot tail, `history` pages, and `item_finished` / `item_updated` progress events. Nothing in the live stream is ever sent whole if it is big.
+- **Snapshot tail** — the most recent items up to 1 MiB encoded (after part truncation), plus `historyCursor` marking where the window starts.
 
 | Command | Purpose |
 | --- | --- |
-| `history { sessionId, before: cursor, limit }` | Page backwards through items older than the window; returns items plus the next cursor. |
-| `read_item { sessionId, itemId }` | Fetch one item untruncated (full tool result, full diff). This is what the interpreter's `read_more` calls. |
+| `history { sessionId, before: cursor, limit? }` | Page backwards. `limit` is a ceiling on item count; the real bound is encoded bytes — the server stops adding items at 4 MiB and returns `next` so the client continues. Parts are truncated exactly as in the snapshot. |
+| `read_item { sessionId, itemId, partIndex, offset, length? }` | Fetch a **byte range** of one content part, `length` capped at 4 MiB; the response carries `{ bytes, offset, totalBytes, next? }`. Full content is obtained by range continuation, never in one message. This is what the interpreter's `read_more` calls (with a small `length`). |
 
-`session_progress` events are unaffected; they are deltas on the live tail. Raising the frame limit is explicitly **not** the answer.
+Raising the frame limit is explicitly **not** the answer; the suite includes a test that a 50 MiB tool result round-trips through snapshot, history, progress, and `read_item` without any message above `MAX_MESSAGE_BYTES`.
 
 #### No-model sessions
 
 `AgentSession.model` may be undefined — no authenticated model, or a resumed session whose persisted model lost its credentials — while v1 `SessionSnapshot.model` is required. The contract:
 
 - In **protocol v2** `model` becomes optional and the snapshot gains `modelState: "ready" | "unavailable"` with a human-readable `modelStateReason`. Such a session is observe-only: `prompt`/`steer` are rejected with `PiServerError("invalid_request", "no model")` until `setModel` succeeds with an authenticated model from `listModels()`.
-- For a connection negotiated at **v1**, sessions without a model are omitted from `list` and `attach` returns `invalid_request` — never a snapshot that would fail schema validation on the client.
-- Both paths are exercised by tests: `create` with no credentials, and `open` of a persisted session whose model is no longer authenticated.
+- For a connection negotiated at **v1** the rule is "never emit a snapshot without `model`":
+  - `create` with no authenticated model (no `model` given and no usable default) is **rejected before any runtime exists**, with `PiServerError("invalid_request", "no authenticated model; pass model or use protocol v2")`. The v1 `create` result requires a `SessionSnapshot`, so there is no schema-valid alternative.
+  - `list` keeps no-model sessions visible — `SessionMetadata` has no model field — so the operator can see them and fix credentials on the host.
+  - `attach` to a no-model session is rejected with the same `invalid_request`; `open` therefore never produces a v1 snapshot either.
+- Tests, in phase 0 (which negotiates v1 only): v1 `create` with no credentials → `invalid_request`, no session file created; v1 `list` still shows a persisted no-model session; v1 `attach` to it → `invalid_request`; and, once v2 lands, the same two sessions attach on v2 with `modelState: "unavailable"`.
 
 #### Project trust
 
 The CLI resolves project trust through `ProjectTrustStore` / `resolveProjectTrusted()` **before** `createAgentSessionServices()`, and non-interactive modes fail closed when no decision exists. The service reuses that gate rather than bypassing it:
 
 - `createSession({ cwd })` and `openSession()` call the same resolver with the daemon's `agentDir` trust store. A recorded decision (`trust.json`) is honoured as-is.
-- **Phases 0–1** are non-interactive: with trust-requiring resources present and no decision, the default is to **reject** (`PiServerError("invalid_request", "project not trusted: <cwd>")`); an opt-in `untrustedProjects: "load-without-protected-resources"` service option loads the session with project extensions/skills/prompts withheld, and the snapshot says so (`projectTrusted: false`). Operators record trust from the TUI (`pi` in that cwd) or `pi --trust`.
-- **Later**, a `ui_request` with `method: "confirm"` carries the trust question to the remote client; an affirmative answer is written through the same trust store so the decision is explicit and persistent, identical to what the TUI would record.
+- **Phases 0–1** are non-interactive: with trust-requiring resources present and no decision, the default is to **reject** (`PiServerError("invalid_request", "project not trusted: <cwd>")`); an opt-in `untrustedProjects: "load-without-protected-resources"` service option loads the session with project extensions/skills/prompts withheld, and the snapshot says so (`projectTrusted: false`).
+- **Recording trust persistently.** Upstream has no `--trust` flag, and `--approve` is a run-only override — `resolveProjectTrusted()` returns it without touching `ProjectTrustStore` — so it cannot pre-seed the daemon. The two paths that persist are: the interactive TUI prompt (`pi` in that cwd, answer *trust*), and a new `ProjectTrustStore`-backed subcommand in Part A, `pi trust <cwd>` / `pi trust --revoke <cwd>`, which writes the same `trust.json` entry the TUI would. The daemon reads that file, so either path takes effect on the next `create`.
+- **Remote decision (phase 2)** is a **server-level** flow, because trust must be decided before `createAgentSessionServices()` runs and therefore before any session exists that could own a `ui_request`:
+  1. `create` on a cwd with trust-requiring resources and no decision fails with the v2 error `project_untrusted`, whose payload lists `cwd` and the resource kinds found (extensions, skills, prompts, settings). v1 connections get `invalid_request`.
+  2. The client shows the same text the TUI shows and, on *trust*, sends the v2 server command `trust_project { cwd, decision: "trust" | "reject" }`. The server writes through `ProjectTrustStore` — persistent, identical to the TUI's record — and answers `{ cwd, trusted }`.
+  3. The client re-issues `create`. There is no pending or half-loaded session to promote; the only state is the trust file.
+
+  `trust_project` is gated by the daemon option `remoteTrustDecisions` (default `true` for device-key and Tailscale identities, since both resolve to the single operator); with it off, step 2 answers `not_implemented` and the operator uses `pi trust`.
 
 ### Protocol additions (v2, additive)
 
@@ -160,8 +182,11 @@ The CLI resolves project trust through `ProjectTrustStore` / `resolveProjectTrus
 
 Today's handshake accepts only `version === PROTOCOL_VERSION`, and the strict v1 codec rejects unknown message shapes — so "gate it on the handshake" is not enough by itself: bumping the constant rejects v1 clients, and sending a v2 event to a v1 decoder breaks it. The negotiation is therefore explicit:
 
-- `hello` carries `supportedVersions: [1, 2]` (client) and the server replies with the highest version both support, or rejects with `unsupported_version` when the ranges do not intersect. `isSupportedProtocolVersion()` becomes a range check.
+- **Pre-negotiation decoder.** The first frame is decoded by a tiny permissive decoder that understands two hello shapes: the unchanged legacy `{ type: "hello", version: 1 }` (which current `PiClient`s send, validated by a strict schema) and the new `{ type: "hello", versions: [1, 2] }`. Only after the first frame does the server pick a codec.
+- **Legacy hello** (`version: N`): if `N === 1` the server answers the exact v1 `hello` reply (`version: 1` literal, `connectionId`, `snapshot`); otherwise it answers the exact v1 `hello_error` with the existing error code `"version"`. No new error code is introduced, because legacy clients cannot decode one.
+- **Negotiating hello** (`versions: [...]`): the server replies with the highest version both support in `version`, or `hello_error` with code `"version"` when the sets do not intersect. `isSupportedProtocolVersion()` becomes a range check used only on this path.
 - The server instantiates a **per-connection codec** for the negotiated version and keeps a per-connection `version` in `ConnectionState`.
+- **Compatibility test**: the unchanged `PiClient` from `v0.84.2` (legacy hello, strict v1 decoder) connects to the v2 server, lists, creates, attaches, prompts, and steers through a full turn — while a v2 client is attached to the same session and a `ui_request` is raised — without a single decode error.
 - **Event filtering**: v2-only events (`ui_request`, `ui_resolved`) are not sent on v1 connections, and v2-only snapshot fields (`modelState`, `pendingUiRequests`, `historyCursor`, `projectTrusted`) are stripped by the v1 encoder. v1 clients see a v1 session and simply cannot answer approvals.
 - Every v2 command and event is additive; nothing in v1 changes meaning.
 
@@ -170,12 +195,14 @@ Today's handshake accepts only `version === PROTOCOL_VERSION`, and the strict v1
 | Command / event | Purpose |
 | --- | --- |
 | `ui_request` event · `ui_respond` command · `ui_resolved` event | Surface extension UI — `confirm`, `select`, `input`, `editor`, and tool-approval prompts — to remote clients, mirroring the `extension_ui_request` / `extension_ui_response` contract in pi's `docs/rpc.md`, including the fire-and-forget methods `notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text` (sent with `expectsResponse: false`). **Non-negotiable**: without it a remote client cannot answer a permission prompt. Semantics under [pending UI requests](#pending-ui-requests). |
-| `history`, `read_item` | Paged transcript history and untruncated item fetch (see [bounded transcript](#bounded-transcript)). |
+| `history`, `read_item` | Byte-bounded transcript paging and ranged content-part fetch (see [bounded transcript](#bounded-transcript)). New v2 error codes used by this section and the ones below: `project_untrusted`, `stale_request`, `stale_revision`; v1 connections receive `invalid_request` in their place. |
 | `fork { sessionId, itemId }`, `switch { sessionId, targetSessionId }` | Session-tree navigation as **server-level** operations. `LiveSessionManager` keys a runtime by its original ID and rejects a snapshot whose ID changes, so neither can mutate the runtime in place. Both return `{ sessionId }` of the destination; the client then performs an explicit `detach` / `attach` transition, and the source runtime is left untouched. |
 | `read_file { path, range }`, `diff { ref? }` | Read-only views for review on a phone. The server enforces cwd-rooted paths and a size cap. |
 | `list_commands` | Discovery metadata for the `/` palette: name, description, source (builtin / extension / skill / template). Execution stays on `prompt` with `source: "rpc"` — `AgentSession.prompt()` already recognises extension commands and expands skills and templates, so a separate `slash` command would duplicate routing and drift from the TUI. |
 | `session_name` | Equivalent of `/name`. |
-| `prompt` / `steer` content (v2) | `{ content: [ { type: "text", text } \| { type: "image", mimeType, data } ] }` alongside v1's `{ text }`. Bounded: `image/png`, `image/jpeg`, `image/webp`, `image/gif`; ≤ 5 MiB per image decoded, ≤ 4 images per message, enforced by the server and by the PWA before sending. This is what lets the composer's camera and paste actually reach `AgentSession`. |
+| `prompt` / `steer` content (v2) | `{ content: [ { type: "text", text } \| { type: "image", mimeType, data } ] }` alongside v1's `{ text }`. `data` is a CBOR **byte string**, not base64, so encoded size ≈ file size. Limits are chosen so the largest legal request is encodable under `MAX_MESSAGE_BYTES` (8 MiB): `image/png`, `image/jpeg`, `image/webp`, `image/gif`; ≤ 2 MiB per image, ≤ 3 images per message (≤ 6 MiB of image bytes), text ≤ 1 MiB. The server rejects anything over with `invalid_request` before touching `AgentSession`; the PWA re-encodes camera and pasted images to fit (longest edge 2048 px, JPEG q≈0.85 — a phone photo lands well under 1 MiB) and refuses the rest. Larger attachments would need a chunked upload plus `image_ref`, which is deliberately not in v1. This is what lets the composer's camera and paste actually reach `AgentSession`. |
+| `trust_project { cwd, decision }` (server-level) | Records a persistent project-trust decision; see [project trust](#project-trust). |
+| `turnOwner` in `SessionSnapshot` (v2) | Server-side turn ownership; see [turn ownership](#turn-ownership). |
 | Mutation envelope (v2) | Every mutating command (`prompt`, `steer`, `abort`, `ui_respond`, `setModel`, `setThinking`, `fork`, `switch`, `session_name`) carries a client-generated `requestId` (UUID) and an `expectedRevision`. The server deduplicates `requestId` per session for a retention window (default 10 minutes, returning the original result) and rejects a mismatched `expectedRevision` with `stale_revision`. See [offline and reconnect](#offline-and-reconnect). |
 
 Terminal access and git mutation stay out of scope.
@@ -187,7 +214,17 @@ An event alone is lossy — a reconnecting client gets an authoritative snapshot
 - **In the snapshot.** `SessionSnapshot.pendingUiRequests: [{ id, method, payload, createdAt, expiresAt? }]`. Pending requests belong to the *session*, not to the connection that happened to be attached when they were raised, so they survive client disconnects and are visible to anything that attaches later.
 - **First response wins, atomically.** The runtime resolves a request exactly once. A second `ui_respond` for the same `id` — from any device — returns `PiServerError("stale_request", "already answered")`; an `id` that never existed or has expired returns `stale_request` too. Every attachment receives `ui_resolved { id, by: connectionId }` so open approval cards close everywhere.
 - **Expiry and cancellation.** Requests carry the extension's timeout when it has one. `abort` cancels all pending requests for the session; the extension sees the same cancellation it would in the TUI. Requests are never transferred or cancelled merely because a connection dropped.
-- **Fire-and-forget methods** are delivered as `ui_request` with `expectsResponse: false`, are never stored in `pendingUiRequests`, and accept no response.
+- **Fire-and-forget methods** are delivered as `ui_request` with `expectsResponse: false` and accept no response, but only `notify` is genuinely transient. `setStatus`, `setWidget`, `setTitle`, and `set_editor_text` change visible UI state, so their *current* values live in the snapshot as `SessionSnapshot.ui: { status: Record<key, text>, widgets: Record<key, lines>, title?: string, editorText?: string }` — exactly the state the TUI keeps for them. A call mutates that map and emits a `ui_state` progress event with the delta; a reconnecting or second client gets the current values from its snapshot and never needs a replay. `notify` is event-only and is dropped for clients that are not attached at the time.
+
+#### Turn ownership
+
+Upstream's `exclusive` / `shared` leases are maps inside one `PiClient`; the server lets every attached connection drive the single runtime, so a phone and a TUI can each believe they hold an exclusive lease. Ownership is therefore made **server-wide** in `LiveSessionManager`:
+
+- `SessionSnapshot.turnOwner?: { connectionId, since }` (v2). It is set **atomically** by the `prompt` that starts a turn and cleared when the phase returns to `idle`.
+- While a turn is owned: `prompt` from anyone is `busy` (as today); `steer` is accepted from the owner and rejected for other connections with `session_locked`; `abort` is accepted from **any** attached connection — every surface is the same operator, and an emergency stop must not depend on which device started the turn. `ui_respond` keeps first-response-wins across all attachments.
+- If the owning connection disconnects mid-turn, the run continues and ownership becomes **orphaned** (`turnOwner` cleared, phase still busy): the next `steer` from any attachment claims ownership atomically for the remainder of the turn. A client that reconnects with the same device identity does not get its ownership back automatically; it steers and re-claims like anyone else.
+- Client-local leases stay as a client-side convenience for a single client's own components; they grant nothing on the server.
+- Phase 6 (TUI as client) relies on this and nothing else to serialise surfaces; open question 3 is resolved by it.
 
 ### CLI: build on `pi server --listen`
 
@@ -215,7 +252,7 @@ pi-palantir/
 
 The upgrade handler runs these checks in order, and any failure is a plain HTTP error before a socket exists:
 
-1. **Origin.** Browsers may open cross-origin WebSockets and the handshake is not protected by CORS, so a malicious page visited by an allowed user could otherwise drive the daemon with that user's tailnet identity. The `Origin` header must equal the daemon's own HTTPS origin exactly. A missing `Origin` is accepted **only** on the native-client path (no cookie; device-key signature over the server nonce carried in `Sec-WebSocket-Protocol`), never for Tailscale zero-click.
+1. **Origin.** Browsers may open cross-origin WebSockets and the handshake is not protected by CORS, so a malicious page visited by an allowed user could otherwise drive the daemon with that user's tailnet identity. The `Origin` header must equal the daemon's configured public origin exactly (`https://<hostname>`, derived from `--hostname`; there is exactly one). A missing `Origin` is accepted **only** on the native-client path (no cookie; device-key signature over the server nonce carried in `Sec-WebSocket-Protocol`), never for Tailscale zero-click.
 2. **Authentication** — one of the two mechanisms below.
 3. Hand-off to `PiServer` with the resolved operator identity attached to the connection.
 
@@ -228,6 +265,8 @@ Two mechanisms, tried in order. Both resolve to an operator identity; anything e
    - `GET /auth/challenge` → `{ nonce, host, issuedAt }` (single use, 60 s).
    - `POST /auth/login` (same origin) with `{ pubkey, signature }` over `nonce ‖ host ‖ issuedAt`.
    - On success the daemon sets a `Secure; HttpOnly; SameSite=Strict; Path=/` cookie (30 days). Its value is an HMAC-signed token binding the key's fingerprint and the daemon's **auth epoch**; the upgrade handler re-validates it on every connection against the current `authorized_keys` and epoch, so `/palantir revoke <name>` (which bumps the epoch for that key, or globally) invalidates already-issued cookies immediately rather than in 30 days.
+
+**Non-tailnet exposure (documented, not built in v1).** `tailscale serve` endpoints and MagicDNS certificates exist only inside the tailnet, so device-key auth alone does not make the daemon reachable from a LAN browser. For that the operator provides the contract the daemon expects: `--bind <lan-ip>:443 --hostname <name that resolves on the LAN> --tls-cert/--tls-key` with a certificate the phone trusts (a private CA installed on the device, or a public name with a DNS-01 Let's Encrypt certificate), **or** a reverse proxy terminating TLS for that hostname and forwarding the upgrade with `X-Forwarded-For` set — the daemon then trusts only that proxy's address. In either case the allowed Origin is `https://<hostname>`, Tailscale zero-click is disabled for non-tailnet peers (`whois` is only consulted for CGNAT `100.64/10` sources), and only device-key logins are accepted. Without trusted HTTPS the PWA, WebCrypto, mic, and Push do not work, so a plain `http://` LAN mode is refused rather than degraded.
 
 `/palantir authorize github:<user>` imports keys from `https://github.com/<user>.keys`. Those serve SSH-capable desktop clients — a browser cannot use an existing private key, which is why browsers get their own generated device key. Revocation is `/palantir revoke <name>` or editing `authorized_keys`.
 
@@ -303,7 +342,7 @@ Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay),
 | 0 | `AgentSessionService` behind `pi server --listen unix:///…` (Part A): bounded snapshots, per-operation guards, no-model encoding, project-trust gate (reject by default) | `PiClient` over a Unix socket can create, attach to, and prompt a real session; the upstream `testing/` suite passes against it, plus tests for no-model create/open and untrusted-cwd rejection. Upstreamable PR. |
 | 1 | WebSocket listener with Origin check, **TLS**, Tailscale auth, minimal transcript view | Open `https://<host>.<tailnet>.ts.net` on a phone over a trusted certificate — service worker, WebCrypto, mic, and Push all require a secure context — and watch a live session. TLS ships in one of two modes: `tailscale serve` in front of a loopback-bound daemon (recommended: Tailscale provisions and renews the certificate and forwards identity headers), or `--tls-cert/--tls-key` from `tailscale cert`, with the daemon warning at startup when the certificate is within 14 days of expiry and refusing to start once it has expired. The served hostname is the MagicDNS name; the raw `100.x` address is not served. |
 | 2 | Protocol v2 negotiation, `ui_request` approvals with `pendingUiRequests`, composer with image parts (camera/paste), mutation envelope with `requestId`/`expectedRevision`, PWA install, push | Drive a full session from a phone, including tool approvals and sending a photo, with two devices attached and no double-answered approval. |
-| 3 | Device-key pairing, `authorized_keys`, revocation | Works from a non-tailnet browser on the LAN. |
+| 3 | Device-key pairing, `authorized_keys`, revocation | A tailnet device whose Tailscale login is **not** in `allowedLogins` (a shared node, or a second account) pairs by QR and drives a session through the phase-1 endpoint; revoking its key closes its connection within one upgrade. Reachability and TLS are unchanged from phase 1 — device keys are authentication only. |
 | 4 | Dictation voice — ElevenLabs and OpenAI first | Hands-free prompt entry. |
 | 5 | Interpreter — Anthropic first, then OpenAI and xAI — plus proactive narration | "What's it doing?", "approve", "also update the tests" — by voice. |
 | 6 | TUI attaches to daemon sessions | One session visible in the terminal and on the phone at once. |
@@ -314,7 +353,7 @@ Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay),
 
 1. **Transcript projection fidelity.** `SessionSnapshot.transcript` is a flattened view of a tree-shaped session; compaction and branches need a defined mapping. The HTML exporter already has one — reuse it rather than writing a second.
 2. **TUI-as-client.** The TUI owns `AgentSession` in-process today. Turning it into a `PiClient` of the daemon is the largest refactor here; the existence of `coding-agent/src/client/remote-session.ts` upstream suggests that direction is already intended. Track upstream before building it.
-3. **Lease semantics.** Phone and TUI may both want to prompt. Proposal: whichever surface prompts takes an exclusive lease for the turn and releases it at turn end; observers hold shared leases.
+3. **Lease semantics.** Resolved by server-side [turn ownership](#turn-ownership); client leases are local conveniences only.
 4. **iOS audio.** Background microphone capture is impossible in Safari, so conversation mode is foreground-only. Acceptable.
 5. **Tailscale LocalAPI availability.** Socket permissions differ across platforms; `tailscale serve` identity headers avoid the LocalAPI entirely, and the device-key path is always present as a fallback.
 6. **Interpreter cost.** Proactive narration can fire often — rate-limit to once per turn end and debounce `ui_request` bursts.
