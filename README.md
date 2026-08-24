@@ -1,8 +1,13 @@
-# pi-palantir
+# pi-huginn
 
 Remote sessions for the [pi coding agent](https://github.com/earendil-works/pi) — run pi on an always-on machine, watch and steer it from a phone, tablet, or another PC, optionally by voice.
 
-> A palantír is a seeing-stone: you look into it and see, and speak with, what is far away.
+> Huginn and Muninn fly each day over the wide world. I fear for Huginn, that he may not
+> return — yet more I fear for Muninn.
+> — *Grímnismál*, 20
+>
+> Huginn is Odin's raven whose name means *thought*. He ranges over the world by day and
+> speaks into Odin's ear what he saw — sight and voice at a distance.
 
 **Status: design only.** Nothing is implemented yet. This README is the architecture proposal; it will shrink into a normal project README as phases land.
 
@@ -14,7 +19,7 @@ Remote sessions for the [pi coding agent](https://github.com/earendil-works/pi) 
 - [What already exists upstream](#what-already-exists-upstream)
 - [Architecture](#architecture)
 - [Part A — upstream server completion](#part-a--upstream-server-completion)
-- [Part B — the palantir package](#part-b--the-palantir-package)
+- [Part B — the huginn package](#part-b--the-huginn-package)
 - [Key decisions](#key-decisions)
 - [Phasing](#phasing)
 - [Open questions and risks](#open-questions-and-risks)
@@ -71,7 +76,7 @@ The work therefore splits cleanly into **(A) finish the server side upstream** �
 │                 │ wss://host.tailnet/pi   (CBOR over TLS)    │
 └─────────────────┼────────────────────────────────────────────┘
                   │  HTTP upgrade: Origin check · auth (Tailscale whois | device-key cookie)
-┌─────────────────▼────────── pi-palantir daemon ──────────────┐
+┌─────────────────▼────────── pi-huginn daemon ────────────────┐
 │  WebSocketListener ──► PiServer (pi-server)                  │
 │                             │ PiServerService                │
 │                      AgentSessionService  (Part A, upstream) │
@@ -83,7 +88,7 @@ The work therefore splits cleanly into **(A) finish the server side upstream** �
 │                                                              │
 │  Static PWA assets · /auth · /pair · /health                 │
 └──────────────────────────────────────────────────────────────┘
-┌──── palantir proxy (required for voice; in the daemon by default) ┐
+┌────── huginn proxy (required for voice; in the daemon by default) ┐
 │  token broker: holds voice provider keys, mints short-lived       │
 │  tokens for the browser · optionally holds the manager key and    │
 │  hosts the manager · optionally hosts the manager state store     │
@@ -114,8 +119,8 @@ Three layers, each seeing only what it needs:
 
 Part A is developed in the existing fork [`frycm/pi`](https://github.com/frycm/pi), checked out as a sibling of this repo (`../pi`). The fork is **always based on the latest stable pi release** — the `vX.Y.Z` tag, currently `v0.84.2` (`914cf14`) — never on upstream `main`. The rules:
 
-- Part A is a small, self-contained patch series (service, protocol v2, transport registration) on a `palantir` branch in the fork, carried on top of the current stable tag. On every upstream release the branch is rebased onto the new tag; anything that no longer applies is fixed or dropped, never worked around.
-- pi-palantir consumes the fork's workspace packages under their real scoped names, pointed at the sibling checkout during development — a `file:` specifier changes where npm reads a package, not its name, so the dependency keys are exactly:
+- Part A is a small, self-contained patch series (service, protocol v2, transport registration) on a `huginn` branch in the fork, carried on top of the current stable tag. On every upstream release the branch is rebased onto the new tag; anything that no longer applies is fixed or dropped, never worked around.
+- pi-huginn consumes the fork's workspace packages under their real scoped names, pointed at the sibling checkout during development — a `file:` specifier changes where npm reads a package, not its name, so the dependency keys are exactly:
 
   ```json
   "dependencies": {
@@ -267,16 +272,16 @@ Upstream's `exclusive` / `shared` leases are maps inside one `PiClient`; the ser
 Upstream already ships experimental `pi server` / `pi client` commands and `pi --listen`, with URL-style transport addresses (`--listen unix:///tmp/pi.sock`) parsed by `transport-address.ts`. Part A does **not** introduce a competing `pi serve` syntax; it completes what is there:
 
 - `pi server --listen unix:///…` runs `AgentSessionService` behind the Unix listener (phase 0).
-- `TransportAddress` gains a registration point so a package can contribute a transport: `pi-palantir` registers `ws://` / `wss://` (`pi server --listen wss://127.0.0.1:7314/pi`), or — simpler for v1 and what phase 1 actually does — the palantir daemon embeds `PiServer` + `AgentSessionService` directly and owns its own process.
+- `TransportAddress` gains a registration point so a package can contribute a transport: `pi-huginn` registers `ws://` / `wss://` (`pi server --listen wss://127.0.0.1:7314/pi`), or — simpler for v1 and what phase 1 actually does — the huginn daemon embeds `PiServer` + `AgentSessionService` directly and owns its own process.
 
 ---
 
-## Part B — the palantir package
+## Part B — the huginn package
 
 ```
-pi-palantir/
+pi-huginn/
 ├─ package.json     # "pi": { "extensions": ["./extension/index.ts"] }
-├─ extension/       # TUI side: /palantir start|stop|status|pair, QR, status-line segment
+├─ extension/       # TUI side: /huginn start|stop|status|pair, QR, status-line segment
 ├─ daemon/          # node: WebSocket listener, auth, static assets
 ├─ proxy/           # optional: provider keys, ephemeral voice tokens, hosted manager
 ├─ manager/         # the manager agent: digests, tools, announcement queue (runs in web/ or proxy/)
@@ -299,14 +304,14 @@ The upgrade handler runs these checks in order, and any failure is a plain HTTP 
 Two mechanisms, tried in order. Both resolve to an operator identity; anything else is a 401 on upgrade.
 
 1. **Tailscale identity — zero-click.** With the daemon bound to the Tailscale interface, the upgrade handler asks the Tailscale LocalAPI `whois` for the peer IP and allows the connection when `UserProfile.LoginName` is in `allowedLogins`. No token, no pairing: the phone just opens the URL. Being IP-based rather than cookie-based, it survives PWA relaunch. `whois` authenticates the *network peer*, not the page that opened the socket — which is why the Origin check above is mandatory on this path. When TLS is terminated by `tailscale serve`, the identity arrives as `Tailscale-User-Login` headers instead; both are accepted.
-2. **Device keys — the SSH-ID feel.** The browser generates a non-extractable Ed25519 keypair via WebCrypto and stores it in IndexedDB. Pairing: `/palantir pair` in the TUI shows a QR code and short code carrying a one-time secret; the PWA posts `{ pubkey, deviceName, pairingSecret }` to `/pair`; the daemon appends the key to `~/.pi/palantir/authorized_keys` in OpenSSH format (`ssh-ed25519 AAAA… phone-martin`). Login is an **HTTP bootstrap**, because a browser's `WebSocket` constructor takes only a URL and subprotocols and cannot set an `Authorization` header:
+2. **Device keys — the SSH-ID feel.** The browser generates a non-extractable Ed25519 keypair via WebCrypto and stores it in IndexedDB. Pairing: `/huginn pair` in the TUI shows a QR code and short code carrying a one-time secret; the PWA posts `{ pubkey, deviceName, pairingSecret }` to `/pair`; the daemon appends the key to `~/.pi/huginn/authorized_keys` in OpenSSH format (`ssh-ed25519 AAAA… phone-martin`). Login is an **HTTP bootstrap**, because a browser's `WebSocket` constructor takes only a URL and subprotocols and cannot set an `Authorization` header:
    - `GET /auth/challenge` → `{ nonce, host, issuedAt }` (single use, 60 s).
    - `POST /auth/login` (same origin) with `{ pubkey, signature }` over `nonce ‖ host ‖ issuedAt`.
-   - On success the daemon sets a `Secure; HttpOnly; SameSite=Strict; Path=/` cookie (30 days). Its value is an HMAC-signed token binding the key's fingerprint and the daemon's **auth epoch**; the upgrade handler re-validates it on every connection against the current `authorized_keys` and epoch, so `/palantir revoke <name>` (which bumps the epoch for that key, or globally) invalidates already-issued cookies immediately rather than in 30 days.
+   - On success the daemon sets a `Secure; HttpOnly; SameSite=Strict; Path=/` cookie (30 days). Its value is an HMAC-signed token binding the key's fingerprint and the daemon's **auth epoch**; the upgrade handler re-validates it on every connection against the current `authorized_keys` and epoch, so `/huginn revoke <name>` (which bumps the epoch for that key, or globally) invalidates already-issued cookies immediately rather than in 30 days.
 
 **Non-tailnet exposure (documented, not built in v1).** `tailscale serve` endpoints and MagicDNS certificates exist only inside the tailnet, so device-key auth alone does not make the daemon reachable from a LAN browser. For that the operator provides the contract the daemon expects: `--bind <lan-ip>:443 --hostname <name that resolves on the LAN> --tls-cert/--tls-key` with a certificate the phone trusts (a private CA installed on the device, or a public name with a DNS-01 Let's Encrypt certificate), **or** a reverse proxy terminating TLS for that hostname and forwarding the upgrade with `X-Forwarded-For` set — the daemon then trusts only that proxy's address. In either case the allowed Origin is `https://<hostname>`, Tailscale zero-click is disabled for non-tailnet peers (`whois` is only consulted for CGNAT `100.64/10` sources), and only device-key logins are accepted. Without trusted HTTPS the PWA, WebCrypto, mic, and Push do not work, so a plain `http://` LAN mode is refused rather than degraded.
 
-`/palantir authorize github:<user>` imports keys from `https://github.com/<user>.keys`. Those serve SSH-capable desktop clients — a browser cannot use an existing private key, which is why browsers get their own generated device key. Revocation is `/palantir revoke <name>` or editing `authorized_keys`.
+`/huginn authorize github:<user>` imports keys from `https://github.com/<user>.keys`. Those serve SSH-capable desktop clients — a browser cannot use an existing private key, which is why browsers get their own generated device key. Revocation is `/huginn revoke <name>` or editing `authorized_keys`.
 
 ### Web client (PWA)
 
@@ -334,9 +339,9 @@ Three realtime speech-to-speech providers, bring-your-own-key, selectable in Set
 
 Recommended order:
 
-1. **OpenAI Realtime first.** WebRTC from the browser is the least work on a phone (the browser handles capture, playback, echo cancellation, and codec), tool calling and mid-conversation injection are the most mature, and the whole agent — prompt and tools — is defined by palantir at connect time.
-2. **ElevenLabs second**, for voice quality — `eleven_v3_conversational` is the most natural voice of the three — and for operators who want Claude behind the voice. The trade-off: prompt, tools, and LLM are configured in the ElevenLabs agent, not by palantir, so palantir ships a reference agent definition and the operator applies it. The proxy holds only the ElevenLabs key; xAI is not among ElevenLabs' hosted LLMs, and a custom endpoint must be OpenAI-compatible.
-3. **xAI third.** Cheapest and the only one that exposes "think" models for voice, but WebSocket-only means palantir owns audio capture and Opus encoding in the browser — more code, and weaker on iOS Safari.
+1. **OpenAI Realtime first.** WebRTC from the browser is the least work on a phone (the browser handles capture, playback, echo cancellation, and codec), tool calling and mid-conversation injection are the most mature, and the whole agent — prompt and tools — is defined by huginn at connect time.
+2. **ElevenLabs second**, for voice quality — `eleven_v3_conversational` is the most natural voice of the three — and for operators who want Claude behind the voice. The trade-off: prompt, tools, and LLM are configured in the ElevenLabs agent, not by huginn, so huginn ships a reference agent definition and the operator applies it. The proxy holds only the ElevenLabs key; xAI is not among ElevenLabs' hosted LLMs, and a custom endpoint must be OpenAI-compatible.
+3. **xAI third.** Cheapest and the only one that exposes "think" models for voice, but WebSocket-only means huginn owns audio capture and Opus encoding in the browser — more code, and weaker on iOS Safari.
 
 The voice agent's system prompt describes the manager and its tools; it does **not** contain session content. Its tool set is small and identical across providers, executed client-side and forwarded to the manager:
 
@@ -407,7 +412,7 @@ It keeps no transcripts and no audio. Without voice, the PWA needs no proxy at a
 
 ### Extension (TUI side)
 
-Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay), `/palantir authorize <key|github:user>`, `/palantir revoke <name>`, and a status-line segment showing connected devices. The daemon is a separate process with launchd and systemd unit templates, so it outlives any one terminal.
+Deliberately thin: `/huginn start|stop|status`, `/huginn pair` (QR overlay), `/huginn authorize <key|github:user>`, `/huginn revoke <name>`, and a status-line segment showing connected devices. The daemon is a separate process with launchd and systemd unit templates, so it outlives any one terminal.
 
 ---
 
@@ -450,7 +455,7 @@ Deliberately thin: `/palantir start|stop|status`, `/palantir pair` (QR overlay),
 4. **iOS audio.** Background microphone capture is impossible in Safari, so conversation mode is foreground-only. Acceptable.
 5. **Tailscale LocalAPI availability.** Socket permissions differ across platforms; `tailscale serve` identity headers avoid the LocalAPI entirely, and the device-key path is always present as a fallback.
 6. **Manager cost and latency.** Two model hops sit between the operator and a session (voice agent → manager). Status questions must be answered from the cached digest, never by a fresh read; only `ask` / `investigate` may be slow, and they are async. Announcements are rate-limited to once per turn end, with `ui_request` bursts debounced.
-7. **Voice-provider tool semantics differ.** All three execute tools client-side and all three accept injected text (`conversation.item.create` on OpenAI and xAI, `sendContextualUpdate` on ElevenLabs), but whether an injected announcement makes the agent *speak* unprompted differs — OpenAI and xAI need an explicit `response.create`, ElevenLabs needs `sendUserMessage` to force a turn. The interrupt policy therefore lives in palantir, which decides *when* to inject, and the per-provider adapter only knows *how*. xAI's WebSocket-only transport also means palantir owns audio capture and encoding for that provider.
+7. **Voice-provider tool semantics differ.** All three execute tools client-side and all three accept injected text (`conversation.item.create` on OpenAI and xAI, `sendContextualUpdate` on ElevenLabs), but whether an injected announcement makes the agent *speak* unprompted differs — OpenAI and xAI need an explicit `response.create`, ElevenLabs needs `sendUserMessage` to force a turn. The interrupt policy therefore lives in huginn, which decides *when* to inject, and the per-provider adapter only knows *how*. xAI's WebSocket-only transport also means huginn owns audio capture and encoding for that provider.
 8. **Read-only enforcement.** Withholding project extensions and removing `bash` is enforceable with what the coding-agent SDK exposes today; the OS sandbox layer is platform-specific and may never be uniform. The open cost is usefulness: an investigation without the project's skills may answer less well than the working session would. Measure before deciding whether worktree-backed full sessions should replace read-only ones for investigations.
 9. **Idle retention upstream.** Keeping an `AgentSession` warm across an idle gap belongs in `PiServer` (see `dispose()` above). Until that option exists, a session with no attachments that goes idle is disposed and re-opened from disk on the next attach — correct, just slower.
 
@@ -474,11 +479,13 @@ Surveyed before starting; none of these combine remote web/mobile access, public
 
 ## Why this name
 
-A palantír is a seeing-stone — you look into it and both *see* and *speak with* what is far away, which is precisely remote observation plus voice. It also fits the Tolkien lineage of pi's own `@earendil-works` scope.
+Huginn (Old Norse *Huginn*, "thought") is one of Odin's two ravens. Each dawn he and Muninn ("memory") fly out over the world; each evening they return and tell Odin what they saw. Huginn is the one who ranges *now* and reports *now* — seeing at a distance and speaking it into the operator's ear, which is precisely remote observation plus voice.
+
+It sits in the same mythic register as its siblings: **huginn** (the thought that flies out and reports back), **muninn** (the memory that returns at evening), **enclave** (the walled, trusted place). [pi-muninn](https://github.com/frycm/pi-muninn) is the other raven, and the pairing is deliberate: Muninn keeps what is worth remembering, Huginn carries what is happening right now.
 
 The obvious names were taken: `pi-web`, `pi-remote`, `pi-relay`, `pi-remote-control`, and `pi-webui` all exist on npm and pi.dev. Considered alternatives: `pi-periscope` (safe, but implies watching only), `pi-parley` (voice, but loses the distance), `pi-osanwe` (Tolkien's *ósanwe*, mind-to-mind speech — perfect meaning, unspellable).
 
-Trademark note: Palantir Technologies holds the mark for software. Many open-source projects use the word, and `pi-palantir` for a personal MIT-licensed tool is low risk — but `pi-periscope` remains the fallback if that ever becomes uncomfortable.
+This project was previously called `pi-palantir`, after Tolkien's seeing-stone. The meaning was right, but Palantir Technologies holds the mark for software, and a name that needs a trademark footnote is a name with a fallback already built into it. Huginn needs no footnote, and it puts the project in the same Eddaic family as its sibling rather than one step removed from it.
 
 ---
 
